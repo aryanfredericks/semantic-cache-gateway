@@ -1,16 +1,4 @@
 services:
-  gateway:
-    build: .
-    ports:
-      - "8000:8000"
-    volumes:
-      - .:/app
-      - /app/.venv
-    depends_on:
-      - postgres
-      - redis
-      - qdrant
-
   postgres:
     image: postgres:16-alpine
     environment:
