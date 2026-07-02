@@ -1,30 +1,29 @@
 # Semantic Cache Gateway
 
-A FastAPI gateway that sits in front of an LLM and serves semantically similar queries from a vector cache instead of hitting the model every time. Reduces latency and API costs for workloads with repetitive or paraphrased prompts — with authentication, rate limiting, provider failover, cost tracking, and Prometheus/Grafana observability built in.
+A FastAPI gateway that sits in front of multiple LLMs and serves semantically similar queries from a vector cache instead of hitting a model every time. Built to demonstrate the infrastructure patterns that make LLM-powered products cheaper, faster, and more reliable at scale: semantic caching, complexity-based routing, provider failover, authentication, rate limiting, cost analytics, and live observability.
+
+## Status
+
+Feature-complete for its intended scope. All core infrastructure patterns below are implemented, tested by hand end-to-end, and instrumented. Kubernetes deployment was considered and deliberately left out of scope — see [Future Extensions](#future-extensions).
 
 ## Vision
 
-Most applications call an LLM provider directly, which means paying full inference cost and latency for every request — even when the same or a semantically equivalent question has already been asked. The **Semantic Cache Gateway** is an intermediary infrastructure layer, modeled on the kind of internal AI platform teams build when running LLM-powered products at scale: every request flows through it, and it's responsible for reducing cost, improving latency, and keeping the system available even when an upstream provider fails.
+Most applications call an LLM provider directly, which means paying full inference cost and latency for every request — even when the same or a semantically equivalent question has already been asked, and even when a simple question doesn't need the most expensive model available. The **Semantic Cache Gateway** is an intermediary infrastructure layer, modeled on the kind of internal AI platform teams build when running LLM-powered products at scale: every request flows through it, and it's responsible for reducing cost, improving latency, routing intelligently, and keeping the system available even when an upstream provider fails.
 
-This is infrastructure, not an application — the interesting part isn't a chat UI, it's what happens between the client and the model: semantic caching, provider abstraction, resilience, and observability.
-
-**Planned capabilities** (beyond what's implemented today):
-- Intelligent model routing — selecting a model based on prompt complexity rather than always calling the same one
-- Kubernetes-ready, horizontally scalable deployment
-
-The project is being built incrementally; the sections below reflect what's implemented and working right now.
+This is infrastructure, not an application — the interesting part isn't a chat UI, it's what happens between the client and the model: semantic caching, provider abstraction, complexity-aware routing, resilience, and observability.
 
 ## How it works
 
 1. **Authenticate** — every request must include a valid `X-API-Key` header, checked against Postgres. Invalid or missing keys are rejected.
-2. **Rate limit** — each API key is allowed 10 requests per 60-second window (Redis-backed token bucket).
+2. **Rate limit** — each API key is allowed 10 requests per 60-second window (Redis-backed fixed-window counter).
 3. **Normalize** — the query is whitespace-collapsed before embedding.
 4. **Embed** — the normalized query is encoded with `BAAI/bge-small-en-v1.5` (384-dimensional vectors, cosine similarity).
-5. **Cache lookup** — Qdrant is searched for semantically similar prompts. If the top non-expired match scores ≥ 0.8, the cached response is returned immediately — no LLM call, no cost.
-6. **LLM call (on cache miss)** — the query is forwarded to Groq (`llama-3.3-70b-versatile`) via LangChain, behind an `LLMProvider` interface. If Groq fails or is unreachable, the gateway automatically fails over to a local Ollama model (`qwen2.5:7b`) instead of erroring out.
-7. **Cache store** — the new prompt/response pair, along with real token usage (from Groq; Ollama's usage metadata is best-effort), is upserted into Qdrant with a 24-hour TTL.
-8. **Cost logging** — every request (hit or miss) is logged to Postgres with token counts, so cache savings are measurable, not estimated.
-9. **Metrics** — cache hits/misses, provider calls, and rate-limit rejections are tracked as Prometheus counters and exposed at `/metrics`, alongside auto-instrumented request latency/throughput.
+5. **Cache lookup** — Qdrant is searched for semantically similar prompts. If the top non-expired match scores ≥ 0.8, the cached response is returned immediately — no LLM call, no cost, no token spend.
+6. **Route (on cache miss)** — a lightweight complexity score is computed from the prompt (length, presence of code/reasoning keywords, multi-part structure). Simple prompts route to a local Ollama model; complex prompts route to Groq.
+7. **Call with failover** — the routed provider is tried first; if it fails, the gateway falls through the remaining providers in order rather than erroring out, behind a shared `LLMProvider` interface.
+8. **Cache store** — the new prompt/response pair, along with real token usage (from Groq; Ollama's usage metadata is best-effort), is upserted into Qdrant with a 24-hour TTL.
+9. **Cost logging** — every request (hit or miss) is logged to Postgres with token counts, so cache savings are measurable, not estimated.
+10. **Metrics** — cache hits/misses, provider calls, routing decisions, token usage, and rate-limit rejections are tracked as Prometheus counters and exposed at `/metrics`, alongside auto-instrumented request latency/throughput — all visualized live in Grafana.
 
 ```
 Client
@@ -40,20 +39,43 @@ Client
                  │
                  ▼
        [Qdrant Vector Search]
-        ↙ hit              ↘ miss
-[Cached Response]      [Groq] ──fails──▶ [Ollama (local)]
-        │                    │                   │
-        │                    ▼                   │
-        │            [Store in Qdrant]            │
-        │                    │                    │
-        ▼                    ▼                    ▼
-              [Log request + tokens → Postgres]
-                             │
-                             ▼
-                        Response
+        ↙ hit                          ↘ miss
+[Cached Response]              [Complexity Router]
+        │                        ↙            ↘
+        │                 [Ollama]          [Groq]
+        │                    │  ╲            ╱  │
+        │                    │   ╲ (failover)╱   │
+        │                    │    ╲        ╱     │
+        │                    ▼     ╲      ╱      ▼
+        │              [Store in Qdrant]◀────────┘
+        │                    │
+        ▼                    ▼
+        [Log request + tokens → Postgres]
+                    │
+                    ▼
+                Response
 ```
 
-Every request also increments Prometheus counters (`cache_hits_total`, `cache_misses_total`, `provider_calls_total`, `rate_limit_rejections_total`), scraped by Prometheus and visualized in Grafana.
+Every request also increments Prometheus counters (`cache_hits_total`, `cache_misses_total`, `provider_calls_total`, `tokens_used_total`, `tokens_saved_total`, `rate_limit_rejections_total`), scraped by Prometheus and visualized in Grafana.
+
+## Routing
+
+Cache-miss requests are routed by a small complexity score (0–1), computed from:
+- Prompt length (weak signal on its own, weighted lightly)
+- Presence of code/technical keywords (e.g. "function", "debug", "algorithm")
+- Presence of reasoning/analysis keywords (e.g. "explain", "compare", "trade-off")
+- Multi-part question structure (lists, "and also", numbered asks)
+
+This is a heuristic, not a learned model — it's deliberately simple and easy to reason about. The routing table (`routing/router.py`) maps complexity thresholds to provider names:
+
+```python
+ROUTING_TABLE = [
+    (0.0, "ollama"),
+    (0.4, "groq"),
+]
+```
+
+Adding a new tier or provider is additive: implement `LLMProvider`, register it in the provider dict, add one `(threshold, name)` entry. No changes needed to the routing or failover logic itself.
 
 ## API
 
@@ -62,7 +84,7 @@ Every request also increments Prometheus counters (`cache_hits_total`, `cache_mi
 | `POST` | `/query` | Yes (`X-API-Key`) | Submit a query. Returns `{ message, cache_hit }`. |
 | `GET` | `/stats` | No | Aggregate usage: total requests, cache hit rate, tokens saved via cache. |
 | `GET` | `/health` | No | Liveness check. Returns `{ status: "healthy" }`. |
-| `GET` | `/metrics` | No | Prometheus metrics (cache hits/misses, provider calls, rate-limit rejections, request latency). |
+| `GET` | `/metrics` | No | Prometheus metrics (cache hits/misses, provider calls, token usage, rate-limit rejections, request latency). |
 
 **Request:**
 ```bash
@@ -92,13 +114,14 @@ curl -X POST http://localhost:8000/query \
 | Layer | Technology |
 |-------|-----------|
 | API server | FastAPI + Uvicorn |
-| LLM provider | Groq (`llama-3.3-70b-versatile`) via LangChain, behind an `LLMProvider` interface |
-| Failover | Local Ollama model (`qwen2.5:7b` via `langchain-ollama`), auto-triggered on Groq failure |
+| LLM providers | Groq (`llama-3.3-70b-versatile`) and local Ollama (`qwen2.5:7b`), both behind a shared `LLMProvider` interface |
+| Routing | Heuristic complexity scoring → provider selection (`routing/`) |
+| Failover | Ordered fallback across providers on call failure |
 | Semantic cache | Qdrant (vector DB, cosine similarity, TTL-based expiry) |
 | Embeddings | `sentence-transformers` — `BAAI/bge-small-en-v1.5` |
 | Auth | API keys stored in Postgres, checked per request |
 | Rate limiting | Redis (fixed-window counter, keyed by API key) |
-| Cost analytics | Postgres request log with real token counts from Groq's `usage_metadata` |
+| Cost analytics | Postgres request log with real token counts from provider usage metadata |
 | Metrics & dashboards | Prometheus (`prometheus-fastapi-instrumentator` + custom counters) + Grafana |
 | Logging | `structlog` — JSON output with request IDs |
 | Runtime | Python 3.14, managed with `uv` |
@@ -109,7 +132,7 @@ curl -X POST http://localhost:8000/query \
 
 - [uv](https://docs.astral.sh/uv/) for Python dependency management
 - Docker + Docker Compose for infrastructure services
-- [Ollama](https://ollama.com/) running locally with the `qwen2.5:7b` model pulled (`ollama pull qwen2.5:7b`) — used as the failover provider if Groq is unreachable
+- [Ollama](https://ollama.com/) running locally with the `qwen2.5:7b` model pulled (`ollama pull qwen2.5:7b`) — used for simple-complexity routing and as Groq's failover
 
 ### 1. Start infrastructure
 
@@ -135,10 +158,10 @@ cp .env.example .env
 
 ```bash
 uv sync
-uv run uvicorn main:app --reload
+uv run uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-The API is available at `http://localhost:8000`.
+The API is available at `http://localhost:8000`. `--host 0.0.0.0` matters if you want Prometheus (running in Docker) to reach the gateway on your host — see the Linux networking note below.
 
 ### 4. Seed a test API key
 
@@ -157,7 +180,17 @@ docker build -t semantic-cache-gateway .
 docker run --env-file .env -p 8000:8000 semantic-cache-gateway
 ```
 
-> Note: when running the app itself in Docker, update `POSTGRES_URL`/Redis/Qdrant hosts to use Docker service names (e.g. `postgres`, `redis`, `qdrant`) rather than `localhost`. See `configs/` for how these are read from environment variables.
+> Note: when running the app itself in Docker, update `POSTGRES_URL`/Redis/Qdrant hosts to use Docker service names (e.g. `postgres`, `redis`, `qdrant`) rather than `localhost`.
+
+### Linux networking note (Prometheus scraping the host)
+
+The gateway runs on the host, not in Compose, so Prometheus (in a container) reaches it via Docker Compose's `host-gateway` mapping (`extra_hosts` in `docker-compose.yaml`). On native Linux, a firewall with a default-deny incoming policy (e.g. `ufw`) will silently block this — connections will hang rather than fail immediately. If Prometheus's target shows `DOWN` with a timeout, check your firewall and allow traffic from Docker's Compose-assigned bridge subnet (find it with `docker network inspect <project>_default`, **not** necessarily the default `docker0` subnet — Compose allocates its own per-project subnet):
+
+```bash
+sudo ufw allow from <compose-bridge-subnet> to any port 8000
+```
+
+This only affects Docker Desktop-less native Linux setups; Mac/Windows Docker Desktop users won't hit this.
 
 ## Configuration
 
@@ -169,12 +202,16 @@ docker run --env-file .env -p 8000:8000 semantic-cache-gateway
 | `REQUESTS_PER_WINDOW` | `configs/redis_config.py` | `10` | Max requests per API key per window |
 | `WINDOW_SECONDS` | `configs/redis_config.py` | `60` | Rate limit window in seconds |
 | `DEFAULT_TTL_SECONDS` | `utils/vector_store.py` | `86400` | Cache entry TTL (24 hours) |
-| Groq model | `configs/groq_config.py` | `llama-3.3-70b-versatile` | LLM used for cache misses |
-| Ollama model / base URL | `providers/ollama_provider.py` | `qwen2.5:7b` / `http://localhost:11434` | Local failover model, used if Groq fails |
+| Groq model | `configs/groq_config.py` | `llama-3.3-70b-versatile` | Used for complex/routed queries and as the general-purpose provider |
+| Ollama model / base URL | `providers/ollama_provider.py` | `qwen2.5:7b` / `http://localhost:11434` | Used for simple/routed queries and as Groq's failover |
+| `ROUTING_TABLE` / `COMPLEXITY_THRESHOLD` | `routing/router.py` | see file | Maps complexity score thresholds to provider names |
 | Prometheus scrape target | `prometheus.yml` | `host-gateway:8000` | Assumes the gateway runs on the host (not in `docker-compose`); relies on the `extra_hosts: host-gateway` mapping |
 | Cost rates | `configs/cost_config.py` | placeholder values | Per-token cost estimates — update to match Groq's published pricing |
 
-**Known simplification:** cost estimates use flat input/output token rates and don't currently account for provider-side prompt caching (`cache_read` tokens in Groq's usage metadata), which is typically billed at a lower rate.
+**Known simplifications:**
+- Cost estimates use flat input/output token rates and don't account for provider-side prompt caching (`cache_read` tokens), which is typically billed at a lower rate.
+- Complexity routing is a hand-tuned heuristic (keyword + length + structure signals), not a learned classifier. The scoring function and routing table are intentionally decoupled so either can be swapped independently.
+- Prometheus counters reset on gateway restart; Postgres (`/stats`) is the authoritative all-time record.
 
 ## Project structure
 
@@ -182,11 +219,13 @@ docker run --env-file .env -p 8000:8000 semantic-cache-gateway
 .
 ├── main.py                    # FastAPI app, request pipeline, Prometheus counters
 ├── seed_key.py                # One-off script to seed a test API key
+├── routing/
+│   ├── query_complexity.py           # Heuristic complexity scoring
+│   └── query_router.py                # Complexity → provider mapping, dispatch + failover
 ├── providers/
 │   ├── base.py                 # LLMProvider abstract interface
 │   ├── groq_provider.py        # Groq via LangChain (async)
-│   ├── ollama_provider.py      # Local Ollama model, used as failover
-│   └── fallback_provider.py    # Static text fallback — legacy, no longer wired in (superseded by ollama_provider.py)
+│   └── ollama_provider.py      # Local Ollama model
 ├── models/
 │   ├── api_key.py              # SQLModel: api_keys table
 │   └── request_logs.py         # SQLModel: request_logs table (cost analytics)
@@ -204,8 +243,17 @@ docker run --env-file .env -p 8000:8000 semantic-cache-gateway
 │   └── cost_config.py           # Token cost estimation rates
 ├── grafana/
 │   └── dashboards/
-│       └── gateway_overview.json  # Cache hit ratio, request rate, latency panels (manual import)
+│       └── gateway_overview.json  # Cache hit ratio, latency, provider mix, token usage panels (manual import)
 ├── prometheus.yml             # Scrape config for the gateway's /metrics endpoint
 ├── docker-compose.yaml        # Postgres, Redis, Qdrant, Prometheus, Grafana
 └── Dockerfile
 ```
+
+## Future Extensions
+
+Deliberately out of scope for the current version, listed here for transparency rather than as promises:
+
+- **Kubernetes deployment** — the gateway is containerized (see `Dockerfile`) and could be deployed via a `Deployment`/`Service`/`ConfigMap`/`Secret` on a local cluster (`kind`/`minikube`). Left out of scope since it primarily demonstrates orchestration familiarity rather than AI infrastructure design, which is this project's focus.
+- **Learned complexity routing** — replacing the current heuristic with a small classifier or a cheap-model-rates-the-prompt approach.
+- **Automated tests** — current verification has been manual (curl + log inspection) throughout development. Unit tests for the complexity scorer, TTL filtering, and normalization would be the highest-value additions.
+- **Provider-side cache-aware cost accounting** — factoring Groq's `cache_read` token pricing into `configs/cost_config.py`.

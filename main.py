@@ -11,9 +11,12 @@ from dotenv import load_dotenv
 from sqlalchemy import func
 from sqlmodel import select
 
+from providers.base import LLMProvider
 from providers.groq_provider import GroqProvider
 from providers.ollama_provider import OllamaProvider
 
+from routing.query_complexity import estimate_complexity
+from routing.query_router import select_provider
 from utils.auth import verify_api_key
 from utils.normalize_query import normalize_prompt
 from utils.vector_store import VectorStore
@@ -49,8 +52,15 @@ CACHE_THRESHOLD = 0.8
 
 
 rate_limiter = RateLimiter()
-provider = GroqProvider(api_key=api_key)
+groq_provider = GroqProvider(api_key=api_key)
 ollama_provider = OllamaProvider()
+
+providers: dict[str, LLMProvider] = {
+    "groq": groq_provider,
+    "ollama": ollama_provider,
+}
+
+FAILOVER_ORDER = ["groq", "ollama"]
 
 embedder = Embedder()
 store = VectorStore()
@@ -79,18 +89,23 @@ async def logging_middleware(request: Request, call_next):
     return response
 
 
-async def call_with_failover(query: str) -> tuple[str, str, dict | None]:
-    try:
-        result, usage = await provider.call(query)
-        return result, "groq", usage
-    except Exception as e:
-        log.warning("provider_failover", primary="groq", error=str(e))
+async def call_with_routing(query: str) -> tuple[str, str, dict | None]:
+    chosen = select_provider(query)
+    log.info("routing_decision", provider=chosen, complexity=estimate_complexity(query))
+
+    # try the routed provider first, then fall back through the rest of FAILOVER_ORDER
+    order = [chosen] + [p for p in FAILOVER_ORDER if p != chosen]
+
+    last_error = None
+    for provider_name in order:
         try:
-            result, usage = await ollama_provider.call(query)
-            return result, "ollama", usage
-        except Exception as e2:
-            log.error("fallback_failed", error=str(e2))
-            raise
+            result, usage = await providers[provider_name].call(query)
+            return result, provider_name, usage
+        except Exception as e:
+            log.warning("provider_failover", attempted=provider_name, error=str(e))
+            last_error = e
+
+    raise last_error
 
 
 async def log_request(api_key, cache_hit, provider_used, prompt_tokens, completion_tokens):
@@ -114,6 +129,14 @@ provider_calls_total = Counter(
 rate_limit_rejections_total = Counter(
     "rate_limit_rejections_total", "Total requests rejected by rate limiting"
 )
+tokens_used_total = Counter(
+    "tokens_used_total", "Total tokens consumed by provider calls", ["provider"]
+)
+tokens_saved_total = Counter(
+    "tokens_saved_total", "Total tokens saved via cache hits"
+)
+
+
 @app.post("/query")
 async def query(request: Request, body: QueryRequest, api_key: str = Depends(verify_api_key)):
     if not rate_limiter.is_allowed(api_key):
@@ -128,15 +151,19 @@ async def query(request: Request, body: QueryRequest, api_key: str = Depends(ver
         cache_hits_total.inc()
         saved_prompt_tokens = matches[0].payload.get("prompt_tokens")
         saved_completion_tokens = matches[0].payload.get("completion_tokens")
+        saved = (saved_prompt_tokens or 0) + (saved_completion_tokens or 0)
+        tokens_saved_total.inc(saved)
         log.info("cache_hit", query=normalized, score=matches[0].score, matched_prompt=matches[0].payload["prompt"])
         await log_request(api_key, cache_hit=True, provider_used=None, prompt_tokens=saved_prompt_tokens, completion_tokens=saved_completion_tokens)
         return {"message": matches[0].payload["response"], "cache_hit": True}
 
-    result, provider_used, usage = await call_with_failover(normalized)
+    result, provider_used, usage = await call_with_routing(normalized)
     cache_misses_total.inc()
     provider_calls_total.labels(provider=provider_used).inc()
     prompt_tokens = usage.get("input_tokens") if usage else None
     completion_tokens = usage.get("output_tokens") if usage else None
+    total = (prompt_tokens or 0) + (completion_tokens or 0)
+    tokens_used_total.labels(provider=provider_used).inc(total)
     await run_in_threadpool(store.upsert, embedding, normalized, result, prompt_tokens, completion_tokens)
 
     log.info("cache_miss", query=normalized, provider_used=provider_used)
