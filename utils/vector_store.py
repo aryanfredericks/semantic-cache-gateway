@@ -22,7 +22,7 @@ class VectorStore:
                 vectors_config=VectorParams(size=VECTOR_SIZE, distance=Distance.COSINE),
             )
 
-    def upsert(self, embedding: list[float], prompt: str, response: str, ttl_seconds: int = DEFAULT_TTL_SECONDS):
+    def upsert(self, embedding: list[float], prompt: str, response: str, prompt_tokens: int, completion_tokens: int, ttl_seconds: int = DEFAULT_TTL_SECONDS):
         point_id = str(uuid.uuid4())
         now = time.time()
         self.client.upsert(
@@ -36,6 +36,8 @@ class VectorStore:
                         "response": response,
                         "created_at": now,
                         "expires_at": now + ttl_seconds,
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": completion_tokens,
                     },
                 )
             ],

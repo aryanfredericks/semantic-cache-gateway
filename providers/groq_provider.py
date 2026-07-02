@@ -11,6 +11,6 @@ class GroqProvider(LLMProvider):
         self.model = ChatGroq(model=self.conf.model_name, api_key=api_key)
         print("Groq model has been initialised.")
 
-    async def call(self, query: str) -> str:
+    async def call(self, query: str) -> tuple[str, dict | None]:
         output = await self.model.ainvoke([HumanMessage(content=query)])
-        return output.content
+        return output.content, output.usage_metadata
